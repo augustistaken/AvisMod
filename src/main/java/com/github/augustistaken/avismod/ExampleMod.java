@@ -12,18 +12,17 @@ import net.minecraft.init.Blocks;
 import net.minecraft.util.AxisAlignedBB;
 import net.minecraft.util.BlockPos;
 import net.minecraft.util.ChatComponentText;
-import net.minecraft.util.MathHelper;
 import net.minecraft.world.World;
 import net.minecraft.world.chunk.Chunk;
 import net.minecraftforge.client.event.RenderWorldLastEvent;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.fml.client.registry.ClientRegistry;
+import net.minecraftforge.fml.common.FMLCommonHandler;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.common.event.FMLInitializationEvent;
 import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
 import net.minecraftforge.fml.common.gameevent.InputEvent;
 import net.minecraftforge.fml.common.gameevent.PlayerEvent;
-import net.minecraftforge.fml.common.gameevent.TickEvent;
 import org.lwjgl.input.Keyboard;
 import org.lwjgl.opengl.GL11;
 
@@ -33,18 +32,21 @@ import java.util.*;
 public class ExampleMod {
 
     private final KeyBinding scanKey = new KeyBinding("Scan for blocks", Keyboard.KEY_V, "AvisMod");
-    private final KeyBinding stopKey = new KeyBinding("Stop Smooth Aim", Keyboard.KEY_B, "AvisMod");
+    private final KeyBinding clearKey = new KeyBinding("Clear path", Keyboard.KEY_B, "AvisMod");
+    private final KeyBinding caneMapKey = new KeyBinding("Map cane aisles", Keyboard.KEY_H, "AvisMod");
 
     @Mod.EventHandler
     public void init(FMLInitializationEvent event) {
         ClientRegistry.registerKeyBinding(scanKey);
-        ClientRegistry.registerKeyBinding(stopKey);
+        ClientRegistry.registerKeyBinding(clearKey);
+        ClientRegistry.registerKeyBinding(caneMapKey);
 
-        Events scanner = new Events(scanKey);
+        Events scanner = new Events(scanKey, clearKey);
         MinecraftForge.EVENT_BUS.register(scanner);
-        SmoothLookController lookController = new SmoothLookController(scanKey, stopKey, scanner);
-
-        MinecraftForge.EVENT_BUS.register(lookController);
+        FMLCommonHandler.instance().bus().register(scanner);
+        CanePathMapper caneMapper = new CanePathMapper(caneMapKey);
+        FMLCommonHandler.instance().bus().register(caneMapper);
+        MinecraftForge.EVENT_BUS.register(caneMapper);
     }
 }
 
@@ -52,16 +54,19 @@ class Events {
     private static final int CHUNK_RADIUS = 2;
     private static final int VERTICAL_RADIUS = 16;
     private static final int MAX_RESULTS = 20;
-    private static final Block TARGET_BLOCK = Blocks.dirt;
+    private static final int PATH_RADIUS = 64;
+    private static final Block TARGET_BLOCK = Blocks.diamond_ore;
 
     EntityPlayer player;
     KeyBinding scanKey;
+    KeyBinding clearKey;
 
     private static List<BlockPos> highlightedBlocks = new ArrayList<>();
     private static List<BlockPos> pathToFirstBlock = new ArrayList<>();
 
-    Events(KeyBinding scanKey) {
+    Events(KeyBinding scanKey, KeyBinding clearKey) {
         this.scanKey = scanKey;
+        this.clearKey = clearKey;
     }
 
 
@@ -74,6 +79,38 @@ class Events {
     public void onPlayerLogin(PlayerEvent.PlayerLoggedInEvent event) {
         player = event.player;
         player.addChatMessage(new ChatComponentText("Hello from AvisMod!"));
+    }
+
+    @SubscribeEvent
+    public void onKeyInput(InputEvent.KeyInputEvent event) {
+        Minecraft mc = Minecraft.getMinecraft();
+        EntityPlayer player = mc.thePlayer;
+        if (player == null || mc.theWorld == null) return;
+
+        if (clearKey.isPressed()) {
+            highlightedBlocks = Collections.emptyList();
+            pathToFirstBlock = Collections.emptyList();
+            player.addChatMessage(new ChatComponentText("\u00A7eDiamond path cleared."));
+            return;
+        }
+
+        if (!scanKey.isPressed()) return;
+
+        findNearestBlocks(player, TARGET_BLOCK, CHUNK_RADIUS, VERTICAL_RADIUS, MAX_RESULTS);
+        BlockPos target = getNextTarget();
+
+        if (target == null) {
+            pathToFirstBlock = Collections.emptyList();
+            player.addChatMessage(new ChatComponentText("\u00A7cNo diamond ore found nearby."));
+            return;
+        }
+
+        pathToFirstBlock = findPath(mc.theWorld, player.getPosition(), target, PATH_RADIUS);
+        if (pathToFirstBlock.isEmpty()) {
+            player.addChatMessage(new ChatComponentText("\u00A7cNo path to the nearest diamond ore was found."));
+        } else {
+            player.addChatMessage(new ChatComponentText("\u00A7aShowing path to diamond ore at " + target));
+        }
     }
 
     public static List<BlockPos> findNearestBlocks(EntityPlayer player, Block targetBlock,
@@ -186,7 +223,7 @@ class Events {
         }
     }
 
-    // --- Rendering both red boxes and green path ---
+    // --- Render only the path to the nearest diamond ore ---
     @SubscribeEvent
     public void onRenderWorldLast(RenderWorldLastEvent event) {
         Minecraft mc = Minecraft.getMinecraft();
@@ -207,13 +244,7 @@ class Events {
         Tessellator tess = Tessellator.getInstance();
         WorldRenderer wr = tess.getWorldRenderer();
 
-        // Draw red boxes for target blocks
-        GlStateManager.color(1.0F, 0.0F, 0.0F, 0.6F);
-        for (BlockPos pos : highlightedBlocks) {
-            drawBox(wr, tess, pos, px, py, pz, 1.0);
-        }
-
-        // Draw green dots for path
+        // Draw green dots for the path
         GlStateManager.color(0.0F, 1.0F, 0.0F, 0.9F);
         for (BlockPos pos : pathToFirstBlock) {
             drawBox(wr, tess, pos, px, py, pz, 0.2);
