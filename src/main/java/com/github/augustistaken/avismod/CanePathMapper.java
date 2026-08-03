@@ -56,6 +56,11 @@ public class CanePathMapper {
             {1, 0}, {-1, 0}, {0, 1}, {0, -1},
             {1, 1}, {1, -1}, {-1, 1}, {-1, -1}
     };
+    private static final int[][] RETURN_OFFSETS = {
+            {1, 0}, {0, 1}, {-1, 0}, {0, -1},
+            {1, 1}, {-1, 1}, {-1, -1}, {1, -1},
+            {2, 0}, {0, 2}, {-2, 0}, {0, -2}
+    };
     private static boolean movementOverrideActive;
     private static float overrideForward;
     private static float overrideStrafe;
@@ -75,7 +80,11 @@ public class CanePathMapper {
     private World mappedWorld;
     private BlockPos scanOrigin;
     private RoutePoint homePoint;
+    private RoutePoint activeReturnPoint;
+    private RoutePoint firstAisleMiddlePoint;
     private BlockPos homeBlock;
+    private BlockPos lastReturnBlock;
+    private int returnVariantCursor;
     private int regrowCheckTicks;
     private int scanX;
     private int scanZ;
@@ -130,6 +139,10 @@ public class CanePathMapper {
         scanOrigin = mc.thePlayer.getPosition();
         homePoint = new RoutePoint(mc.thePlayer.posX, mc.thePlayer.posY, mc.thePlayer.posZ);
         homeBlock = mc.thePlayer.getPosition();
+        activeReturnPoint = null;
+        firstAisleMiddlePoint = null;
+        lastReturnBlock = null;
+        returnVariantCursor = 0;
         waitingForRegrowth = false;
         regrowCheckTicks = 0;
         scanX = -SCAN_RADIUS;
@@ -356,6 +369,8 @@ public class CanePathMapper {
     private List<RoutePoint> buildSerpentineRoute(World world, EntityPlayer player, List<Aisle> aisles) {
         List<RoutePoint> route = new ArrayList<>();
         List<Aisle> remaining = new ArrayList<>(aisles);
+        activeReturnPoint = null;
+        firstAisleMiddlePoint = null;
         RoutePoint current = new RoutePoint(player.posX, player.posY, player.posZ);
         BlockPos currentBlock = player.getPosition();
         boolean visitedAisle = false;
@@ -405,6 +420,9 @@ public class CanePathMapper {
 
             List<RoutePoint> orderedAisle = new ArrayList<>(selected.nodes);
             if (reverse) Collections.reverse(orderedAisle);
+            if (!visitedAisle) {
+                firstAisleMiddlePoint = orderedAisle.get(orderedAisle.size() / 2);
+            }
 
             remaining.remove(selected);
             appendConnector(world, route, bestConnector);
@@ -425,18 +443,48 @@ public class CanePathMapper {
         }
 
         if (visitedAisle && homePoint != null && currentBlock != null) {
-            BlockPos returnGoal = nearestNavigableBlock(world, homePoint,
-                    homeBlock != null ? homeBlock : currentBlock);
-            if (returnGoal != null) {
-                List<BlockPos> returnConnector = findSafePath(world, currentBlock, returnGoal);
-                if (!returnConnector.isEmpty()) {
-                    appendConnector(world, route, returnConnector);
-                    appendRoutePoint(route, homePoint);
-                }
+            ReturnDestination destination = chooseReturnDestination(world, currentBlock);
+            if (destination != null) {
+                activeReturnPoint = destination.point;
+                appendConnector(world, route, destination.path);
+                appendRoutePoint(route, destination.point);
             }
         }
 
         return route;
+    }
+
+    private ReturnDestination chooseReturnDestination(World world, BlockPos currentBlock) {
+        if (homeBlock == null || homePoint == null) return null;
+
+        for (int attempt = 0; attempt < RETURN_OFFSETS.length; attempt++) {
+            int index = (returnVariantCursor + attempt) % RETURN_OFFSETS.length;
+            int[] offset = RETURN_OFFSETS[index];
+            BlockPos candidate = findSafeStep(world,
+                    homeBlock.add(offset[0], 0, offset[1]));
+            if (candidate == null || candidate.equals(lastReturnBlock)) continue;
+
+            List<BlockPos> path = findSafePath(world, currentBlock, candidate);
+            if (path.isEmpty()) continue;
+
+            lastReturnBlock = candidate;
+            returnVariantCursor = (index + 1) % RETURN_OFFSETS.length;
+            return new ReturnDestination(routePoint(candidate), path);
+        }
+
+        if (lastReturnBlock != null && isNavigable(world, lastReturnBlock)) {
+            List<BlockPos> repeatedPath = findSafePath(world, currentBlock, lastReturnBlock);
+            if (!repeatedPath.isEmpty()) {
+                return new ReturnDestination(routePoint(lastReturnBlock), repeatedPath);
+            }
+        }
+
+        BlockPos fallback = nearestNavigableBlock(world, homePoint, homeBlock);
+        if (fallback == null) return null;
+        List<BlockPos> fallbackPath = findSafePath(world, currentBlock, fallback);
+        if (fallbackPath.isEmpty()) return null;
+        lastReturnBlock = fallback;
+        return new ReturnDestination(homePoint, fallbackPath);
     }
 
     private boolean isBehindCurrentHeading(RoutePoint current, RoutePoint target,
@@ -638,12 +686,13 @@ public class CanePathMapper {
 
         RoutePoint node = chooseSteeringNode(world, player);
         boolean atFinalNode = pathIndex == travelPath.size() - 1;
-        boolean finalNodeIsHome = atFinalNode && homePoint != null && node.samePosition(homePoint);
-        boolean finalReached = finalNodeIsHome ? reachedHome(player) : reached(player, node);
+        boolean finalNodeIsReturn = atFinalNode && activeReturnPoint != null
+                && node.samePosition(activeReturnPoint);
+        boolean finalReached = finalNodeIsReturn ? reachedReturnPoint(player) : reached(player, node);
         if (finalReached && atFinalNode) {
             releaseMovement();
             pathIndex = travelPath.size();
-            if (finalNodeIsHome) {
+            if (finalNodeIsReturn) {
                 beginRegrowthWait(player);
             } else if (!completionAnnounced) {
                 completionAnnounced = true;
@@ -690,23 +739,28 @@ public class CanePathMapper {
         }
     }
 
-    private boolean reachedHome(EntityPlayer player) {
-        if (homePoint == null) return false;
-        double dx = homePoint.x - player.posX;
-        double dz = homePoint.z - player.posZ;
+    private boolean reachedReturnPoint(EntityPlayer player) {
+        if (activeReturnPoint == null) return false;
+        double dx = activeReturnPoint.x - player.posX;
+        double dz = activeReturnPoint.z - player.posZ;
         return dx * dx + dz * dz <= 0.15 * 0.15
-                && Math.abs(player.posY - homePoint.y) < 1.2;
+                && Math.abs(player.posY - activeReturnPoint.y) < 1.2;
     }
 
     private void beginRegrowthWait(EntityPlayer player) {
         waitingForRegrowth = true;
         regrowCheckTicks = 0;
         player.addChatMessage(new ChatComponentText(
-                "\u00A7eReturned home. Waiting for the mapped cane to regrow..."));
+                "\u00A7eReturned near home. Waiting for the mapped cane to regrow..."));
     }
 
     private void processRegrowthWait(Minecraft mc, World world, EntityPlayer player) {
         releaseMovementIfOwned();
+        if (mc.currentScreen == null && firstAisleMiddlePoint != null) {
+            turnCameraNaturally(player, firstAisleMiddlePoint.x,
+                    player.posY + player.getEyeHeight(), firstAisleMiddlePoint.z,
+                    false, false);
+        }
         if (++regrowCheckTicks < REGROW_CHECK_INTERVAL_TICKS) return;
         regrowCheckTicks = 0;
         if (mappedCanePositions.isEmpty()) return;
@@ -880,8 +934,8 @@ public class CanePathMapper {
                     Math.max(1.2, entryDistance - 0.8));
             return chooseSmoothRouteLookPoint(player, steeringNode, lookAhead, -1);
         }
-        if (fastTransitionTurn && homePoint != null) {
-            return chooseSmoothRouteLookPoint(player, homePoint, 3.4, -1);
+        if (fastTransitionTurn && activeReturnPoint != null) {
+            return chooseSmoothRouteLookPoint(player, activeReturnPoint, 3.4, -1);
         }
         return chooseSmoothRouteLookPoint(player, steeringNode, 4.8, currentAisleId());
     }
@@ -1121,7 +1175,7 @@ public class CanePathMapper {
     }
 
     private boolean isReturningHome() {
-        if (currentAisleId() >= 0 || homePoint == null || !hasPreviousAisle()) return false;
+        if (currentAisleId() >= 0 || activeReturnPoint == null || !hasPreviousAisle()) return false;
         for (int i = pathIndex; i < travelPath.size(); i++) {
             if (travelPath.get(i).aisleId >= 0) return false;
         }
@@ -1558,7 +1612,11 @@ public class CanePathMapper {
         regrowCheckTicks = 0;
         mappedWorld = null;
         homePoint = null;
+        activeReturnPoint = null;
+        firstAisleMiddlePoint = null;
         homeBlock = null;
+        lastReturnBlock = null;
+        returnVariantCursor = 0;
         mappedCanePositions.clear();
         markedCane.clear();
         caneBases.clear();
@@ -1611,6 +1669,16 @@ public class CanePathMapper {
         overrideStrafe = 0.0F;
         overrideJump = false;
         movementOwned = false;
+    }
+
+    private static class ReturnDestination {
+        final RoutePoint point;
+        final List<BlockPos> path;
+
+        ReturnDestination(RoutePoint point, List<BlockPos> path) {
+            this.point = point;
+            this.path = path;
+        }
     }
 
     private static class Aisle {
