@@ -50,6 +50,9 @@ public class CanePathMapper {
     private static final double SIDE_AIM_OUTSET = 0.16;
     private static final int REGROW_CHECK_INTERVAL_TICKS = 40;
     private static final double REGROW_READY_RATIO = 0.95;
+    private static final int WAIT_LOOK_PAUSE_TICKS = 2;
+    private static final int WAIT_LOOK_MIN_DURATION_TICKS = 7;
+    private static final int WAIT_LOOK_MAX_DURATION_TICKS = 18;
     private static final double BREAK_REACH = 4.45;
     private static final double NODE_REACHED_DISTANCE = 0.42;
     private static final int[][] PATH_DIRECTIONS = {
@@ -75,6 +78,8 @@ public class CanePathMapper {
     private boolean active;
     private boolean scanning;
     private boolean waitingForRegrowth;
+    private boolean waitingLookInitialized;
+    private boolean waitingLookComplete;
     private boolean movementOwned;
     private boolean completionAnnounced;
     private World mappedWorld;
@@ -86,6 +91,9 @@ public class CanePathMapper {
     private BlockPos lastReturnBlock;
     private int returnVariantCursor;
     private int regrowCheckTicks;
+    private int waitingLookPauseTicks;
+    private int waitingLookTick;
+    private int waitingLookDuration;
     private int scanX;
     private int scanZ;
     private int pathIndex;
@@ -103,6 +111,10 @@ public class CanePathMapper {
     private boolean previousPauseOnLostFocus;
     private float yawVelocity;
     private float pitchVelocity;
+    private float waitingLookStartYaw;
+    private float waitingLookYawDelta;
+    private float waitingLookStartPitch;
+    private float waitingLookPitchDelta;
     private final double cameraNoiseSeed = Math.random() * Math.PI * 2.0;
     private double aimOffsetX;
     private double aimOffsetY;
@@ -144,6 +156,7 @@ public class CanePathMapper {
         lastReturnBlock = null;
         returnVariantCursor = 0;
         waitingForRegrowth = false;
+        resetWaitingLook();
         regrowCheckTicks = 0;
         scanX = -SCAN_RADIUS;
         scanZ = -SCAN_RADIUS;
@@ -183,6 +196,10 @@ public class CanePathMapper {
         }
 
         if (event.phase == TickEvent.Phase.END) {
+            if (waitingForRegrowth && mc.currentScreen == null) {
+                updateNaturalWaitingLook(mc.thePlayer);
+                return;
+            }
             if (!scanning && !waitingForRegrowth && mc.currentScreen == null && !travelPath.isEmpty()
                     && pathIndex < travelPath.size()) {
                 updateHeadAndBreak(mc, mc.thePlayer, mc.theWorld,
@@ -749,6 +766,7 @@ public class CanePathMapper {
 
     private void beginRegrowthWait(EntityPlayer player) {
         waitingForRegrowth = true;
+        resetWaitingLook();
         regrowCheckTicks = 0;
         player.addChatMessage(new ChatComponentText(
                 "\u00A7eReturned near home. Waiting for the mapped cane to regrow..."));
@@ -756,11 +774,6 @@ public class CanePathMapper {
 
     private void processRegrowthWait(Minecraft mc, World world, EntityPlayer player) {
         releaseMovementIfOwned();
-        if (mc.currentScreen == null && firstAisleMiddlePoint != null) {
-            turnCameraNaturally(player, firstAisleMiddlePoint.x,
-                    player.posY + player.getEyeHeight(), firstAisleMiddlePoint.z,
-                    false, false);
-        }
         if (++regrowCheckTicks < REGROW_CHECK_INTERVAL_TICKS) return;
         regrowCheckTicks = 0;
         if (mappedCanePositions.isEmpty()) return;
@@ -798,9 +811,73 @@ public class CanePathMapper {
         jumpHoldTicks = 0;
         yawVelocity = 0.0F;
         pitchVelocity = 0.0F;
+        resetWaitingLook();
         player.addChatMessage(new ChatComponentText(
                 "\u00A7aCane regrown (" + ready + "/" + mappedCanePositions.size()
                         + "). Starting another farming cycle."));
+    }
+
+    private void updateNaturalWaitingLook(EntityPlayer player) {
+        if (waitingLookComplete || firstAisleMiddlePoint == null) return;
+        if (waitingLookPauseTicks < WAIT_LOOK_PAUSE_TICKS) {
+            waitingLookPauseTicks++;
+            return;
+        }
+
+        if (!waitingLookInitialized) initializeNaturalWaitingLook(player);
+        if (waitingLookComplete) return;
+
+        waitingLookTick++;
+        double progress = Math.min(1.0,
+                waitingLookTick / (double) waitingLookDuration);
+        double eased = 0.5 - 0.5 * Math.cos(Math.PI * progress);
+        player.rotationYaw = waitingLookStartYaw
+                + waitingLookYawDelta * (float) eased;
+        player.rotationPitch = clamp(waitingLookStartPitch
+                + waitingLookPitchDelta * (float) eased, -88.0F, 88.0F);
+        player.rotationYawHead = player.rotationYaw;
+
+        if (progress >= 1.0) {
+            waitingLookComplete = true;
+            yawVelocity = 0.0F;
+            pitchVelocity = 0.0F;
+        }
+    }
+
+    private void initializeNaturalWaitingLook(EntityPlayer player) {
+        waitingLookInitialized = true;
+        waitingLookStartYaw = player.rotationYaw;
+        waitingLookStartPitch = player.rotationPitch;
+
+        double dx = firstAisleMiddlePoint.x - player.posX;
+        double dz = firstAisleMiddlePoint.z - player.posZ;
+        double horizontal = Math.sqrt(dx * dx + dz * dz);
+        if (horizontal < 0.05) {
+            waitingLookComplete = true;
+            return;
+        }
+
+        float targetYaw = (float) (MathHelper.atan2(dz, dx) * 180.0 / Math.PI) - 90.0F;
+        float targetPitch = 0.0F;
+        waitingLookYawDelta = wrapDegrees(targetYaw - waitingLookStartYaw);
+        waitingLookPitchDelta = targetPitch - waitingLookStartPitch;
+        float largestTurn = Math.max(Math.abs(waitingLookYawDelta),
+                Math.abs(waitingLookPitchDelta));
+        waitingLookDuration = Math.max(WAIT_LOOK_MIN_DURATION_TICKS,
+                Math.min(WAIT_LOOK_MAX_DURATION_TICKS,
+                        (int) Math.ceil(largestTurn / 10.0F)));
+    }
+
+    private void resetWaitingLook() {
+        waitingLookInitialized = false;
+        waitingLookComplete = false;
+        waitingLookPauseTicks = 0;
+        waitingLookTick = 0;
+        waitingLookDuration = WAIT_LOOK_MIN_DURATION_TICKS;
+        waitingLookStartYaw = 0.0F;
+        waitingLookYawDelta = 0.0F;
+        waitingLookStartPitch = 0.0F;
+        waitingLookPitchDelta = 0.0F;
     }
 
     private boolean isJumpableObstacleAhead(World world, EntityPlayer player, RoutePoint node) {
@@ -1609,6 +1686,7 @@ public class CanePathMapper {
         active = false;
         scanning = false;
         waitingForRegrowth = false;
+        resetWaitingLook();
         regrowCheckTicks = 0;
         mappedWorld = null;
         homePoint = null;
